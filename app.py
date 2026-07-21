@@ -36,9 +36,29 @@ WANTED_HEIGHTS = [1080, 720, 480, 360]
 TMP_ROOT = os.path.join(tempfile.gettempdir(), "nhyt_downloads")
 os.makedirs(TMP_ROOT, exist_ok=True)
 
+# ── Bot-bypass base options ──────────────────────────────────────────────────
+# YouTube blocks plain server IPs as bots. Using android+web player clients
+# bypasses the "Sign in to confirm you're not a bot" error without cookies.
+YDL_BASE = {
+    "quiet": True,
+    "noplaylist": True,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        }
+    },
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Mobile Safari/537.36"
+        ),
+    },
+}
+
 
 def extract_info(url):
-    opts = {"quiet": True, "noplaylist": True, "skip_download": True}
+    opts = {**YDL_BASE, "skip_download": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -127,7 +147,7 @@ def download():
     #    direct URL without touching disk.
     if "+" not in format_id and format_id != "bestaudio/best":
         try:
-            opts = {"quiet": True, "noplaylist": True, "format": format_id}
+            opts = {**YDL_BASE, "format": format_id}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 resolved = ydl.extract_info(url, download=False)
         except Exception as e:
@@ -161,8 +181,7 @@ def download():
     is_audio_only = format_id.strip() == "bestaudio/best"
 
     opts = {
-        "quiet": True,
-        "noplaylist": True,
+        **YDL_BASE,
         "format": format_id,
         "outtmpl": outtmpl,
     }
