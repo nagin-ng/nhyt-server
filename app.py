@@ -37,7 +37,7 @@ def _base_opts():
         "ignore_no_formats_error": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv_embedded", "ios", "web"],
+                "player_client": ["web", "android"],
             }
         },
         "http_headers": {
@@ -163,9 +163,11 @@ def download():
     error_holder = {}
 
     def run_download():
+        print("MERGE: thread started for", format_id, flush=True)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
+            print("MERGE: yt-dlp download() returned OK", flush=True)
         except Exception as e:
             error_holder["error"] = str(e)
             print("MERGE ERROR:", str(e), flush=True)
@@ -186,14 +188,19 @@ def download():
         # sit idle (some proxies drop connections with no data for too long).
         sent = 0
         wait_start = time.time()
+        file_seen = False
         # Wait for yt-dlp/ffmpeg to actually create the output file
         while not os.path.exists(out_path) and not done_event.is_set():
             if time.time() - wait_start > 60:
+                print("MERGE: gave up waiting for output file after 60s", flush=True)
                 break
             time.sleep(0.3)
 
         while True:
             if os.path.exists(out_path):
+                if not file_seen:
+                    print("MERGE: output file appeared, streaming started", flush=True)
+                    file_seen = True
                 with open(out_path, "rb") as f:
                     f.seek(sent)
                     chunk = f.read(65536)
@@ -208,10 +215,12 @@ def download():
                         f.seek(sent)
                         rest = f.read()
                     if rest:
+                        sent += len(rest)
                         yield rest
                 break
             time.sleep(0.4)
 
+        print("MERGE: stream finished, total bytes sent:", sent, flush=True)
         shutil.rmtree(job_dir, ignore_errors=True)
 
     print("DOWNLOAD stream starting:", format_id, flush=True)
