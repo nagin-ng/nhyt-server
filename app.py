@@ -77,68 +77,27 @@ def info():
         return jsonify(success=False, error=str(e)), 500
 
     title = data.get("title", "YouTube Video")
-    all_formats = data.get("formats", [])
 
-    progressive = {}
-    for f in all_formats:
-        h = f.get("height")
-        if h in WANTED_HEIGHTS \
-                and f.get("vcodec") not in (None, "none") \
-                and f.get("acodec") not in (None, "none"):
-            if h not in progressive or f.get("ext") == "mp4":
-                progressive[h] = f["format_id"]
-
-    video_only = {}
-    for f in all_formats:
-        h = f.get("height")
-        if h in WANTED_HEIGHTS \
-                and f.get("vcodec") not in (None, "none") \
-                and f.get("acodec") in (None, "none"):
-            if h not in video_only or (f.get("ext") == "mp4" and video_only[h][1] != "mp4"):
-                video_only[h] = (f["format_id"], f.get("ext"))
-
-    audio_only = [f for f in all_formats
-                  if f.get("vcodec") in (None, "none")
-                  and f.get("acodec") not in (None, "none")]
-    has_audio = len(audio_only) > 0
-    best_audio = max(audio_only, key=lambda f: f.get("abr") or 0) if audio_only else None
-
+    # We deliberately don't introspect the raw formats list here — different
+    # yt-dlp player clients (tv_embedded/ios/web) structure height/codec
+    # fields inconsistently, which was causing false "no formats found"
+    # failures. Instead we always offer standard quality selectors; yt-dlp
+    # resolves the actual best-available match for THIS video at download
+    # time, gracefully falling back to a lower height if needed.
     result_formats = []
     for h in WANTED_HEIGHTS:
-        if h in progressive:
-            result_formats.append({
-                "label": "Video {}p (MP4)".format(h),
-                "format_id": progressive[h],
-                "type": "progressive",
-            })
-        elif h in video_only and has_audio:
-            result_formats.append({
-                "label": "Video {}p (MP4)".format(h),
-                "format_id": "{}+bestaudio/best".format(video_only[h][0]),
-                "type": "merge",
-            })
-
-    if best_audio:
         result_formats.append({
-            "label": "Audio Only ({})".format((best_audio.get("ext") or "m4a").upper()),
-            "format_id": "bestaudio/best",
-            "type": "audio",
-        })
-
-    # Fallback: if none of our exact height buckets matched (video has an
-    # unusual format list), still offer a guaranteed "best available" option
-    # instead of failing outright.
-    if not result_formats and all_formats:
-        result_formats.append({
-            "label": "Best Available Quality (Auto)",
-            "format_id": "bestvideo+bestaudio/best",
+            "label": "Video {}p (MP4)".format(h),
+            "format_id": "best[height<={0}]/bestvideo[height<={0}]+bestaudio/best".format(h),
             "type": "merge",
         })
+    result_formats.append({
+        "label": "Audio Only (M4A)",
+        "format_id": "bestaudio/best",
+        "type": "audio",
+    })
 
-    if not result_formats:
-        return jsonify(success=False, error="No downloadable formats found"), 404
-
-    print("INFO OK:", title, len(result_formats), "formats", flush=True)
+    print("INFO OK:", title, flush=True)
     return jsonify(success=True, title=title, formats=result_formats)
 
 
