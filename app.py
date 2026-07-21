@@ -1,198 +1,211 @@
 """
-NH YT Downloader — Railway Python Backend
-yt-dlp with YouTube bot-detection bypass.
+NH YT Downloader — self-hosted backend (v2, all resolutions)
+--------------------------------------------------------------
+- 360p (progressive, video+audio already combined by YouTube): streamed
+  directly, no disk write, very fast.
+- 720p / 1080p / audio-only: YouTube serves these as SEPARATE video-only and
+  audio-only streams. yt-dlp downloads both and merges them with ffmpeg into
+  one file, which is then streamed back and cleaned up.
+
+Requires ffmpeg on the server (see Dockerfile).
+
+Endpoints:
+  GET /api/info?url=<youtube_url>
+      -> { success, title, formats: [{label, format_id, type}] }
+      format_id is either a plain yt-dlp format id (progressive, e.g. "18")
+      or a yt-dlp format *selector* string (merge, e.g. "137+bestaudio/best").
+
+  GET /api/download?url=<youtube_url>&format_id=<id_or_selector>
+      -> streams the file back.
+
+  GET /
+      -> health check
 """
 
 import os
-import subprocess
-import json
-import urllib.request
+import uuid
+import shutil
+import tempfile
 from flask import Flask, request, jsonify, Response, stream_with_context
+import yt_dlp
+import requests
 
 app = Flask(__name__)
 
-# ── Auto-update yt-dlp on startup ─────────────────────────────────────────────
-try:
-    subprocess.run(
-        ["pip", "install", "-q", "--upgrade", "yt-dlp"],
-        capture_output=True, timeout=120
-    )
-    print("yt-dlp updated")
-except Exception as e:
-    print(f"yt-dlp update failed: {e}")
-
-# ── yt-dlp args with YouTube bypass ──────────────────────────────────────────
-# Using Android client which bypasses bot detection without cookies
-YT_BASE_ARGS = [
-    "yt-dlp",
-    "--no-playlist",
-    "--extractor-retries", "3",
-    "--socket-timeout", "30",
-    "--extractor-args", "youtube:player_client=android,web",
-]
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def run_ytdlp_json(url: str) -> dict | None:
-    try:
-        result = subprocess.run(
-            YT_BASE_ARGS + ["--dump-json", url],
-            capture_output=True, text=True, timeout=90
-        )
-        if result.returncode != 0:
-            print("yt-dlp stderr:", result.stderr[-800:])
-            return None
-        return json.loads(result.stdout)
-    except Exception as e:
-        print("run_ytdlp_json exception:", e)
-        return None
+WANTED_HEIGHTS = [1080, 720, 480, 360]
+TMP_ROOT = os.path.join(tempfile.gettempdir(), "nhyt_downloads")
+os.makedirs(TMP_ROOT, exist_ok=True)
 
 
-def build_label(fmt: dict) -> str:
-    vcodec = fmt.get("vcodec", "none")
-    acodec = fmt.get("acodec", "none")
-    height = fmt.get("height")
-    ext    = fmt.get("ext", "")
-
-    if vcodec != "none" and height:
-        return f"Video {height}p ({ext.upper()})"
-    elif vcodec != "none":
-        return f"Video ({ext.upper()})"
-    elif acodec != "none":
-        abr = fmt.get("abr")
-        if abr:
-            return f"Audio Only {int(abr)}kbps ({ext.upper()})"
-        return f"Audio Only ({ext.upper()})"
-    else:
-        return f"Format {fmt.get('format_id', '?')} ({ext.upper()})"
-
-
-PREFERRED_HEIGHTS = [1080, 720, 480, 360, 240]
-
-def select_best_formats(formats: list) -> list:
-    video_audio = [f for f in formats if f.get("vcodec","none") != "none" and f.get("acodec","none") != "none"]
-    video_only  = [f for f in formats if f.get("vcodec","none") != "none" and f.get("acodec","none") == "none"]
-    audio_only  = [f for f in formats if f.get("vcodec","none") == "none"  and f.get("acodec","none") != "none"]
-
-    selected = []
-    seen_heights = set()
-
-    for h in PREFERRED_HEIGHTS:
-        candidates = [f for f in video_audio if f.get("height") == h and f.get("ext") == "mp4"]
-        if not candidates:
-            candidates = [f for f in video_audio if f.get("height") == h]
-        if not candidates:
-            candidates = [f for f in video_only if f.get("height") == h and f.get("ext") == "mp4"]
-        if not candidates:
-            candidates = [f for f in video_only if f.get("height") == h]
-
-        if candidates and h not in seen_heights:
-            best = candidates[0]
-            seen_heights.add(h)
-            selected.append({
-                "format_id": best["format_id"],
-                "label":     build_label(best),
-                "type":      "video",
-                "ext":       best.get("ext", "mp4")
-            })
-
-    if audio_only:
-        audio_only_sorted = sorted(audio_only, key=lambda f: f.get("abr") or 0, reverse=True)
-        best_audio = audio_only_sorted[0]
-        selected.append({
-            "format_id": best_audio["format_id"],
-            "label":     build_label(best_audio),
-            "type":      "audio",
-            "ext":       best_audio.get("ext", "m4a")
-        })
-
-    return selected
-
-
-# ── routes ────────────────────────────────────────────────────────────────────
-
-@app.route("/api/info")
-def api_info():
-    url = request.args.get("url", "").strip()
-    if not url:
-        return jsonify({"success": False, "error": "Missing url parameter"}), 400
-
-    info = run_ytdlp_json(url)
-    if info is None:
-        return jsonify({"success": False, "error": "yt-dlp failed. Try again or video is unavailable."}), 500
-
-    formats_raw = info.get("formats", [])
-    formats     = select_best_formats(formats_raw)
-
-    if not formats:
-        return jsonify({"success": False, "error": "No downloadable formats found."}), 500
-
-    return jsonify({
-        "success": True,
-        "title":   info.get("title", "YouTube Video"),
-        "formats": formats
-    })
-
-
-@app.route("/api/download")
-def api_download():
-    url       = request.args.get("url", "").strip()
-    format_id = request.args.get("format_id", "").strip()
-
-    if not url or not format_id:
-        return jsonify({"success": False, "error": "Missing url or format_id"}), 400
-
-    try:
-        result = subprocess.run(
-            YT_BASE_ARGS + ["-f", format_id, "-g", url],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return jsonify({"success": False, "error": "Could not resolve download URL."}), 500
-
-        direct_url = result.stdout.strip().splitlines()[0]
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-    ext = "mp4"
-    try:
-        info = run_ytdlp_json(url)
-        if info:
-            for f in info.get("formats", []):
-                if str(f.get("format_id")) == str(format_id):
-                    ext = f.get("ext", "mp4")
-                    break
-    except Exception:
-        pass
-
-    filename = f"nhyt_{format_id}.{ext}"
-
-    def generate():
-        req = urllib.request.Request(direct_url, headers={
-            "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36"
-        })
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-
-    return Response(
-        stream_with_context(generate()),
-        content_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
+def extract_info(url):
+    opts = {"quiet": True, "noplaylist": True, "skip_download": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
 
 
 @app.route("/")
-def index():
-    return jsonify({
-        "status": "NH YT Downloader API running",
-        "endpoints": ["/api/info", "/api/download"]
-    })
+def home():
+    return jsonify(status="ok", service="NH YT Downloader API v2")
+
+
+@app.route("/api/info")
+def info():
+    url = request.args.get("url")
+    if not url:
+        return jsonify(success=False, error="Missing url"), 400
+
+    try:
+        data = extract_info(url)
+    except Exception as e:
+        return jsonify(success=False, error=str(e)), 500
+
+    title = data.get("title", "YouTube Video")
+    all_formats = data.get("formats", [])
+
+    # Progressive mp4 (video+audio combined) — YouTube reliably only offers
+    # this at up to 360p.
+    progressive = {}
+    for f in all_formats:
+        h = f.get("height")
+        if h in WANTED_HEIGHTS and f.get("vcodec") not in (None, "none") \
+                and f.get("acodec") not in (None, "none") and f.get("ext") == "mp4":
+            if h not in progressive:
+                progressive[h] = f["format_id"]
+
+    # Video-only formats (for merging with best audio) at each wanted height
+    video_only = {}
+    for f in all_formats:
+        h = f.get("height")
+        if h in WANTED_HEIGHTS and f.get("vcodec") not in (None, "none") \
+                and f.get("acodec") in (None, "none"):
+            # prefer mp4/avc for compatibility & faster remux
+            if h not in video_only or (f.get("ext") == "mp4" and video_only[h][1] != "mp4"):
+                video_only[h] = (f["format_id"], f.get("ext"))
+
+    audio_only = [f for f in all_formats
+                  if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")]
+    has_audio = len(audio_only) > 0
+    best_audio = max(audio_only, key=lambda f: f.get("abr") or 0) if audio_only else None
+
+    result_formats = []
+    for h in WANTED_HEIGHTS:
+        if h in progressive:
+            result_formats.append({
+                "label": f"Video {h}p (MP4)",
+                "format_id": progressive[h],
+                "type": "progressive",
+            })
+        elif h in video_only and has_audio:
+            vid_id = video_only[h][0]
+            result_formats.append({
+                "label": f"Video {h}p (MP4)",
+                "format_id": f"{vid_id}+bestaudio/best",
+                "type": "merge",
+            })
+
+    if best_audio:
+        result_formats.append({
+            "label": f"Audio Only ({(best_audio.get('ext') or 'm4a').upper()})",
+            "format_id": "bestaudio/best",
+            "type": "audio",
+        })
+
+    if not result_formats:
+        return jsonify(success=False, error="No downloadable formats found"), 404
+
+    return jsonify(success=True, title=title, formats=result_formats)
+
+
+@app.route("/api/download")
+def download():
+    url = request.args.get("url")
+    format_id = request.args.get("format_id")
+    if not url or not format_id:
+        return jsonify(success=False, error="Missing url or format_id"), 400
+
+    # ── Fast path: plain format id with no "+" -> progressive, proxy the
+    #    direct URL without touching disk.
+    if "+" not in format_id and format_id != "bestaudio/best":
+        try:
+            opts = {"quiet": True, "noplaylist": True, "format": format_id}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                resolved = ydl.extract_info(url, download=False)
+        except Exception as e:
+            return jsonify(success=False, error=str(e)), 500
+
+        direct_url = resolved.get("url")
+        req_headers = resolved.get("http_headers", {}) or {}
+        if direct_url:
+            ext = resolved.get("ext", "mp4")
+
+            def generate_proxy():
+                with requests.get(direct_url, headers=req_headers, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            yield chunk
+
+            return Response(
+                stream_with_context(generate_proxy()),
+                mimetype="application/octet-stream",
+                headers={"Content-Disposition": f'attachment; filename="nhyt_download.{ext}"'},
+            )
+        # fall through to merge path if no direct url was resolvable
+
+    # ── Merge path: download video+audio (or best audio) and mux with ffmpeg,
+    #    then stream the resulting file and clean up.
+    job_dir = os.path.join(TMP_ROOT, uuid.uuid4().hex)
+    os.makedirs(job_dir, exist_ok=True)
+    outtmpl = os.path.join(job_dir, "out.%(ext)s")
+
+    is_audio_only = format_id.strip() == "bestaudio/best"
+
+    opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "format": format_id,
+        "outtmpl": outtmpl,
+    }
+    if is_audio_only:
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "m4a",
+        }]
+    else:
+        opts["merge_output_format"] = "mp4"
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify(success=False, error=str(e)), 500
+
+    produced = [f for f in os.listdir(job_dir) if f.startswith("out.")]
+    if not produced:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify(success=False, error="Merge/download produced no output file"), 500
+
+    out_path = os.path.join(job_dir, produced[0])
+    ext = produced[0].split(".")[-1]
+
+    def generate_file():
+        try:
+            with open(out_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+    return Response(
+        stream_with_context(generate_file()),
+        mimetype="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="nhyt_download.{ext}"'},
+    )
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
