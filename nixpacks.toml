@@ -1,5 +1,9 @@
+# Force Nixpacks to install ffmpeg (needed for video+audio merging)
 [phases.setup]
-aptPkgs = ["ffmpeg"]
+nixPkgs = ["ffmpeg", "python311"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
 
 [start]
-cmd = "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 2"
+cmd = "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 1"

@@ -1,24 +1,27 @@
 """
-NH YT Downloader — self-hosted backend (v3, bot-bypass)
---------------------------------------------------------
-Endpoints:
-  GET /api/info?url=<youtube_url>
-      -> { success, title, formats: [{label, format_id, type}] }
-
-  GET /api/download?url=<youtube_url>&format_id=<id_or_selector>
-      -> streams the file back.
-
-  GET /
-      -> health check
+NH YT Downloader - self-hosted backend v5
 """
-
 import os
+import sys
 import uuid
 import shutil
 import tempfile
+
+# Print startup info immediately so Railway logs show something
+print("=== NH YT Downloader starting ===", flush=True)
+print("Python:", sys.version, flush=True)
+
 from flask import Flask, request, jsonify, Response, stream_with_context
+
+print("Flask imported OK", flush=True)
+
 import yt_dlp
+
+print("yt_dlp imported OK, version:", getattr(yt_dlp, 'version', {}).get('__version__', 'unknown'), flush=True)
+
 import requests
+
+print("requests imported OK", flush=True)
 
 app = Flask(__name__)
 
@@ -26,19 +29,14 @@ WANTED_HEIGHTS = [1080, 720, 480, 360]
 TMP_ROOT = os.path.join(tempfile.gettempdir(), "nhyt_downloads")
 os.makedirs(TMP_ROOT, exist_ok=True)
 
-# cookies.txt path — optional but strongest bot bypass.
-# Place a YouTube cookies.txt (Netscape format, exported from Chrome while
-# logged into YouTube) at /app/cookies.txt on Railway to enable it.
 COOKIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+print("cookies.txt present:", os.path.isfile(COOKIES_PATH), flush=True)
 
 
 def _base_opts():
-    """Return yt-dlp base options with bot-bypass settings."""
     opts = {
-        "quiet": True,
+        "quiet": False,
         "noplaylist": True,
-        # tv_embedded client bypasses "Sign in to confirm you're not a bot"
-        # on server IPs without needing cookies. ios is the next best fallback.
         "extractor_args": {
             "youtube": {
                 "player_client": ["tv_embedded", "ios", "web"],
@@ -52,7 +50,6 @@ def _base_opts():
             ),
         },
     }
-    # Use cookies if the file exists
     if os.path.isfile(COOKIES_PATH):
         opts["cookiefile"] = COOKIES_PATH
     return opts
@@ -60,7 +57,7 @@ def _base_opts():
 
 @app.route("/")
 def home():
-    return jsonify(status="ok", service="NH YT Downloader API v3")
+    return jsonify(status="ok", service="NH YT Downloader API v5")
 
 
 @app.route("/api/info")
@@ -69,18 +66,20 @@ def info():
     if not url:
         return jsonify(success=False, error="Missing url"), 400
 
+    print("INFO request for:", url, flush=True)
+
     try:
         opts = _base_opts()
         opts["skip_download"] = True
         with yt_dlp.YoutubeDL(opts) as ydl:
             data = ydl.extract_info(url, download=False)
     except Exception as e:
+        print("INFO error:", str(e), flush=True)
         return jsonify(success=False, error=str(e)), 500
 
     title = data.get("title", "YouTube Video")
     all_formats = data.get("formats", [])
 
-    # Progressive mp4 (video+audio combined) — YouTube only offers up to 360p
     progressive = {}
     for f in all_formats:
         h = f.get("height")
@@ -91,7 +90,6 @@ def info():
             if h not in progressive:
                 progressive[h] = f["format_id"]
 
-    # Video-only formats for merging with best audio
     video_only = {}
     for f in all_formats:
         h = f.get("height")
@@ -134,6 +132,7 @@ def info():
     if not result_formats:
         return jsonify(success=False, error="No downloadable formats found"), 404
 
+    print("INFO OK:", title, "formats:", len(result_formats), flush=True)
     return jsonify(success=True, title=title, formats=result_formats)
 
 
@@ -144,7 +143,8 @@ def download():
     if not url or not format_id:
         return jsonify(success=False, error="Missing url or format_id"), 400
 
-    # Fast path: plain format id (progressive) — proxy direct URL, no disk write
+    print("DOWNLOAD request format:", format_id, flush=True)
+
     if "+" not in format_id and format_id != "bestaudio/best":
         try:
             opts = _base_opts()
@@ -152,6 +152,7 @@ def download():
             with yt_dlp.YoutubeDL(opts) as ydl:
                 resolved = ydl.extract_info(url, download=False)
         except Exception as e:
+            print("DOWNLOAD resolve error:", str(e), flush=True)
             return jsonify(success=False, error=str(e)), 500
 
         direct_url = resolved.get("url")
@@ -172,22 +173,16 @@ def download():
                 headers={"Content-Disposition": 'attachment; filename="nhyt_download.{}"'.format(ext)},
             )
 
-    # Merge path: download video+audio with ffmpeg, stream result, clean up
     job_dir = os.path.join(TMP_ROOT, uuid.uuid4().hex)
     os.makedirs(job_dir, exist_ok=True)
     outtmpl = os.path.join(job_dir, "out.%(ext)s")
-
     is_audio_only = format_id.strip() == "bestaudio/best"
 
     opts = _base_opts()
     opts["format"] = format_id
     opts["outtmpl"] = outtmpl
-
     if is_audio_only:
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "m4a",
-        }]
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]
     else:
         opts["merge_output_format"] = "mp4"
 
@@ -196,6 +191,7 @@ def download():
             ydl.download([url])
     except Exception as e:
         shutil.rmtree(job_dir, ignore_errors=True)
+        print("DOWNLOAD merge error:", str(e), flush=True)
         return jsonify(success=False, error=str(e)), 500
 
     produced = [f for f in os.listdir(job_dir) if f.startswith("out.")]
@@ -224,5 +220,7 @@ def download():
     )
 
 
+print("=== App ready, routes registered ===", flush=True)
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
