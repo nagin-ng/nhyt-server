@@ -84,9 +84,8 @@ def info():
         h = f.get("height")
         if h in WANTED_HEIGHTS \
                 and f.get("vcodec") not in (None, "none") \
-                and f.get("acodec") not in (None, "none") \
-                and f.get("ext") == "mp4":
-            if h not in progressive:
+                and f.get("acodec") not in (None, "none"):
+            if h not in progressive or f.get("ext") == "mp4":
                 progressive[h] = f["format_id"]
 
     video_only = {}
@@ -124,6 +123,16 @@ def info():
             "label": "Audio Only ({})".format((best_audio.get("ext") or "m4a").upper()),
             "format_id": "bestaudio/best",
             "type": "audio",
+        })
+
+    # Fallback: if none of our exact height buckets matched (video has an
+    # unusual format list), still offer a guaranteed "best available" option
+    # instead of failing outright.
+    if not result_formats and all_formats:
+        result_formats.append({
+            "label": "Best Available Quality (Auto)",
+            "format_id": "bestvideo+bestaudio/best",
+            "type": "merge",
         })
 
     if not result_formats:
