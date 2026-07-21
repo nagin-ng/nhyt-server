@@ -1,10 +1,6 @@
 """
 NH YT Downloader — Railway Python Backend
-yt-dlp powered with auto-update on startup.
-
-Endpoints:
-  GET /api/info?url=<youtube_url>
-  GET /api/download?url=<youtube_url>&format_id=<id>
+yt-dlp with YouTube bot-detection bypass.
 """
 
 import os
@@ -21,16 +17,18 @@ try:
         ["pip", "install", "-q", "--upgrade", "yt-dlp"],
         capture_output=True, timeout=120
     )
-    print("yt-dlp updated successfully")
+    print("yt-dlp updated")
 except Exception as e:
     print(f"yt-dlp update failed: {e}")
 
-# ── Base yt-dlp args (bypass YouTube bot detection) ───────────────────────────
+# ── yt-dlp args with YouTube bypass ──────────────────────────────────────────
+# Using Android client which bypasses bot detection without cookies
 YT_BASE_ARGS = [
     "yt-dlp",
     "--no-playlist",
     "--extractor-retries", "3",
     "--socket-timeout", "30",
+    "--extractor-args", "youtube:player_client=android,web",
 ]
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -42,7 +40,7 @@ def run_ytdlp_json(url: str) -> dict | None:
             capture_output=True, text=True, timeout=90
         )
         if result.returncode != 0:
-            print("yt-dlp error:", result.stderr[-500:])
+            print("yt-dlp stderr:", result.stderr[-800:])
             return None
         return json.loads(result.stdout)
     except Exception as e:
@@ -121,7 +119,7 @@ def api_info():
 
     info = run_ytdlp_json(url)
     if info is None:
-        return jsonify({"success": False, "error": "yt-dlp failed. Video may be unavailable or age-restricted."}), 500
+        return jsonify({"success": False, "error": "yt-dlp failed. Try again or video is unavailable."}), 500
 
     formats_raw = info.get("formats", [])
     formats     = select_best_formats(formats_raw)
@@ -144,7 +142,6 @@ def api_download():
     if not url or not format_id:
         return jsonify({"success": False, "error": "Missing url or format_id"}), 400
 
-    # Resolve direct URL via yt-dlp -g
     try:
         result = subprocess.run(
             YT_BASE_ARGS + ["-f", format_id, "-g", url],
@@ -157,7 +154,6 @@ def api_download():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-    # Determine extension
     ext = "mp4"
     try:
         info = run_ytdlp_json(url)
