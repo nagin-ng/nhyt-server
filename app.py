@@ -6,6 +6,8 @@ import sys
 import uuid
 import shutil
 import tempfile
+import threading
+import time
 
 print("=== STARTUP: Python", sys.version, "===", flush=True)
 print("=== PORT env:", os.environ.get("PORT", "NOT SET"), "===", flush=True)
@@ -144,6 +146,10 @@ def download():
     os.makedirs(job_dir, exist_ok=True)
     outtmpl = os.path.join(job_dir, "out.%(ext)s")
     is_audio_only = format_id.strip() == "bestaudio/best"
+    # We fix the final extension up front so we can start streaming (and set
+    # Content-Disposition) before the file even exists.
+    final_ext = "m4a" if is_audio_only else "mp4"
+    out_path = os.path.join(job_dir, "out." + final_ext)
 
     opts = _base_opts()
     opts["format"] = format_id
@@ -153,38 +159,66 @@ def download():
     else:
         opts["merge_output_format"] = "mp4"
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        print("MERGE ERROR:", str(e), flush=True)
-        return jsonify(success=False, error=str(e)), 500
+    done_event = threading.Event()
+    error_holder = {}
 
-    produced = [f for f in os.listdir(job_dir) if f.startswith("out.")]
-    if not produced:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify(success=False, error="Merge produced no output file"), 500
-
-    out_path = os.path.join(job_dir, produced[0])
-    ext = produced[0].split(".")[-1]
-
-    def generate_file():
+    def run_download():
         try:
-            with open(out_path, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            error_holder["error"] = str(e)
+            print("MERGE ERROR:", str(e), flush=True)
         finally:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            done_event.set()
 
+    threading.Thread(target=run_download, daemon=True).start()
+
+    # Give it a short window to fail fast (bad format string, video removed,
+    # etc.) before we commit to streaming a response.
+    done_event.wait(timeout=5)
+    if done_event.is_set() and "error" in error_holder and not os.path.exists(out_path):
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify(success=False, error=error_holder["error"]), 500
+
+    def generate_tail():
+        # Send response headers/first bytes ASAP so the connection doesn't
+        # sit idle (some proxies drop connections with no data for too long).
+        sent = 0
+        wait_start = time.time()
+        # Wait for yt-dlp/ffmpeg to actually create the output file
+        while not os.path.exists(out_path) and not done_event.is_set():
+            if time.time() - wait_start > 60:
+                break
+            time.sleep(0.3)
+
+        while True:
+            if os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    f.seek(sent)
+                    chunk = f.read(65536)
+                if chunk:
+                    sent += len(chunk)
+                    yield chunk
+                    continue
+            if done_event.is_set():
+                # final flush of any bytes written after our last read
+                if os.path.exists(out_path):
+                    with open(out_path, "rb") as f:
+                        f.seek(sent)
+                        rest = f.read()
+                    if rest:
+                        yield rest
+                break
+            time.sleep(0.4)
+
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+    print("DOWNLOAD stream starting:", format_id, flush=True)
     return Response(
-        stream_with_context(generate_file()),
+        stream_with_context(generate_tail()),
         mimetype="application/octet-stream",
-        headers={"Content-Disposition":
-                 'attachment; filename="nhyt_download.{}"'.format(ext)},
+        headers={"Content-Disposition": 'attachment; filename="nhyt_download.{}"'.format(final_ext)},
     )
 
 
