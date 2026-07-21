@@ -32,6 +32,7 @@ def _base_opts():
     opts = {
         "quiet": False,
         "noplaylist": True,
+        "ignore_no_formats_error": True,
         "extractor_args": {
             "youtube": {
                 "player_client": ["tv_embedded", "ios", "web"],
