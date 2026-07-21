@@ -37,30 +37,78 @@ TMP_ROOT = os.path.join(tempfile.gettempdir(), "nhyt_downloads")
 os.makedirs(TMP_ROOT, exist_ok=True)
 
 # ── Bot-bypass base options ──────────────────────────────────────────────────
-# YouTube blocks plain server IPs as bots. Using android+web player clients
-# bypasses the "Sign in to confirm you're not a bot" error without cookies.
+# YouTube aggressively blocks server IPs. We try multiple player clients in
+# order until one works. tv_embedded is the most reliable on server IPs
+# because it uses a different auth path that doesn't require a signed-in user.
+# ios and mweb are fallbacks. android alone is no longer sufficient (2024+).
+#
+# COOKIES (optional but strongest fix):
+#   Place a YouTube cookies.txt (Netscape format) at /app/cookies.txt
+#   Export it from Chrome using "Get cookies.txt LOCALLY" extension while
+#   logged into YouTube. If the file exists it is used automatically.
+COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
+
+# Ordered list of player clients to try. tv_embedded first — it bypasses
+# the bot check on most server IPs without needing cookies.
+_PLAYER_CLIENTS = [
+    ["tv_embedded", "web"],
+    ["ios", "web"],
+    ["android", "web"],
+    ["mweb"],
+]
+
 YDL_BASE = {
     "quiet": True,
     "noplaylist": True,
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
+            "player_client": ["tv_embedded", "ios", "web"],
+            "skip": ["hls", "dash"],           # prefer direct http formats
         }
     },
     "http_headers": {
         "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Mobile Safari/537.36"
+            "Chrome/124.0.6367.82 Mobile Safari/537.36"
         ),
     },
+    # Use cookies.txt if present — strongest bypass for age/bot restricted videos
+    **({"cookiefile": COOKIES_PATH} if os.path.isfile(COOKIES_PATH) else {}),
 }
 
 
+def _ydl_opts(extra: dict) -> dict:
+    """Merge YDL_BASE with extra opts."""
+    merged = {**YDL_BASE, **extra}
+    # extractor_args needs a deep merge, not overwrite
+    if "extractor_args" in extra:
+        ea = {**YDL_BASE.get("extractor_args", {})}
+        for k, v in extra["extractor_args"].items():
+            ea[k] = {**ea.get(k, {}), **v}
+        merged["extractor_args"] = ea
+    return merged
+
+
 def extract_info(url):
-    opts = {**YDL_BASE, "skip_download": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    """Try each player client in turn; return first success."""
+    last_err = None
+    for clients in _PLAYER_CLIENTS:
+        opts = _ydl_opts({
+            "skip_download": True,
+            "extractor_args": {"youtube": {"player_client": clients}},
+        })
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            # Only retry on bot/auth errors; propagate everything else
+            if "Sign in" not in err_str and "bot" not in err_str.lower() \
+                    and "confirm" not in err_str.lower():
+                raise
+    raise last_err
 
 
 @app.route("/")
@@ -147,7 +195,7 @@ def download():
     #    direct URL without touching disk.
     if "+" not in format_id and format_id != "bestaudio/best":
         try:
-            opts = {**YDL_BASE, "format": format_id}
+            opts = _ydl_opts({"format": format_id})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 resolved = ydl.extract_info(url, download=False)
         except Exception as e:
@@ -180,11 +228,10 @@ def download():
 
     is_audio_only = format_id.strip() == "bestaudio/best"
 
-    opts = {
-        **YDL_BASE,
+    opts = _ydl_opts({
         "format": format_id,
         "outtmpl": outtmpl,
-    }
+    })
     if is_audio_only:
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
